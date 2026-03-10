@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from scipy.stats import kurtosis, rankdata, skew
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -139,7 +141,7 @@ def pairwise_interactions(
     mouse_df: pd.DataFrame,
     bin_size_s: float,
     include_within_region: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame,np.ndarray]:
     all_spikes = np.concatenate(mouse_df["spike_times"].to_numpy())
     recording_start = 0.0 if np.nanmin(all_spikes) >= 0 else float(np.nanmin(all_spikes))
     recording_end = float(np.nanmax(all_spikes)) + bin_size_s
@@ -170,7 +172,7 @@ def pairwise_interactions(
         raise ValueError("No region pairs produced an interaction table.")
 
     matrix_df = build_population_matrix(result_df, value_col="population_corr")
-    return result_df, matrix_df
+    return result_df, matrix_df, binned
 
 
 def summarize_region_pair(
@@ -365,6 +367,319 @@ def plot_within_area_abs_summary(combined_df: pd.DataFrame, output_dir: Path) ->
     )
     plt.close(fig)
 
+def compute_neuron_binned_diagnostics(
+    binned: np.ndarray,
+    mouse_df: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+
+    for i in range(binned.shape[0]):
+        x = binned[i]
+        mean_count = float(np.mean(x))
+        std_count = float(np.std(x))
+        zero_frac = float(np.mean(x == 0))
+        max_count = float(np.max(x))
+        median_count = float(np.median(x))
+
+        if std_count == 0:
+            skewness = np.nan
+            kurt = np.nan
+        else:
+            skewness = float(skew(x, bias=False))
+            kurt = float(kurtosis(x, fisher=True, bias=False))
+
+        if mean_count > 0:
+            cv = float(std_count / mean_count)
+        else:
+            cv = np.nan
+
+        if median_count > 0:
+            max_to_median = float(max_count / median_count)
+        else:
+            max_to_median = np.nan if max_count == 0 else np.inf
+
+        rows.append(
+            {
+                "cluster_id": mouse_df.iloc[i]["cluster_id"],
+                "brain_region": mouse_df.iloc[i]["brain_region"],
+                "mean_count": mean_count,
+                "std_count": std_count,
+                "cv": cv,
+                "zero_fraction": zero_frac,
+                "max_count": max_count,
+                "median_count": median_count,
+                "max_to_median": max_to_median,
+                "skewness": skewness,
+                "kurtosis": kurt,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+def spearman_or_nan(trace_a: np.ndarray, trace_b: np.ndarray) -> float:
+    if trace_a.size != trace_b.size:
+        raise ValueError("Time series must have the same number of bins.")
+    if np.std(trace_a) == 0 or np.std(trace_b) == 0:
+        return np.nan
+
+    rank_a = rankdata(trace_a)
+    rank_b = rankdata(trace_b)
+    return float(np.corrcoef(rank_a, rank_b)[0, 1])
+
+def compute_pair_metric_comparison(
+    binned: np.ndarray,
+    mouse_df: pd.DataFrame,
+    max_pairs: int | None = 5000,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    n_neurons = binned.shape[0]
+    all_pairs = list(combinations(range(n_neurons), 2))
+
+    if max_pairs is not None and len(all_pairs) > max_pairs:
+        rng = np.random.default_rng(random_state)
+        pair_idx = rng.choice(len(all_pairs), size=max_pairs, replace=False)
+        pairs = [all_pairs[k] for k in pair_idx]
+    else:
+        pairs = all_pairs
+
+    rows: list[dict[str, object]] = []
+
+    for i, j in pairs:
+        x = binned[i]
+        y = binned[j]
+
+        pearson_r = correlation_or_nan(x, y)
+        spearman_r = spearman_or_nan(x, y)
+
+        if np.isnan(pearson_r) or np.isnan(spearman_r):
+            continue
+
+        rows.append(
+            {
+                "cluster_i": mouse_df.iloc[i]["cluster_id"],
+                "cluster_j": mouse_df.iloc[j]["cluster_id"],
+                "region_i": mouse_df.iloc[i]["brain_region"],
+                "region_j": mouse_df.iloc[j]["brain_region"],
+                "pearson_r": pearson_r,
+                "spearman_r": spearman_r,
+                "abs_diff": abs(pearson_r - spearman_r),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+def plot_skewness_distribution(
+    diag_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sns.histplot(
+        diag_df["skewness"].dropna(),
+        bins=40,
+        kde=True,
+        ax=ax,
+    )
+    ax.set_title("Distribution of spike-count skewness across neurons")
+    ax.set_xlabel("Skewness")
+    ax.set_ylabel("Number of neurons")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_kurtosis_distribution(
+    diag_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sns.histplot(
+        diag_df["kurtosis"].dropna(),
+        bins=40,
+        kde=True,
+        ax=ax,
+    )
+    ax.set_title("Distribution of spike-count kurtosis across neurons")
+    ax.set_xlabel("Excess kurtosis")
+    ax.set_ylabel("Number of neurons")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_zero_fraction_distribution(
+    diag_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sns.histplot(
+        diag_df["zero_fraction"].dropna(),
+        bins=40,
+        kde=False,
+        ax=ax,
+    )
+    ax.set_title("Distribution of zero-bin fraction across neurons")
+    ax.set_xlabel("Fraction of 100 ms bins with zero spikes")
+    ax.set_ylabel("Number of neurons")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_max_to_median_distribution(
+    diag_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    values = diag_df["max_to_median"].replace([np.inf, -np.inf], np.nan).dropna()
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sns.histplot(values, bins=40, kde=False, ax=ax)
+    ax.set_title("Distribution of max/median spike-count ratio")
+    ax.set_xlabel("Max count / median count")
+    ax.set_ylabel("Number of neurons")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_pair_metric_difference_on_ax(
+    pair_df: pd.DataFrame,
+    ax: plt.Axes,
+) -> None:
+    values = pair_df["abs_diff"].dropna() if not pair_df.empty else pd.Series(dtype=float)
+    if values.empty:
+        ax.text(0.5, 0.5, "No valid pairs", ha="center", va="center")
+        ax.set_title("Absolute difference: Pearson vs Spearman")
+        ax.set_xlabel(r"$|r_P - r_S|$")
+        ax.set_ylabel("Count")
+        return
+
+    sns.histplot(values, bins=40, kde=True, ax=ax)
+    ax.set_title("Absolute difference: Pearson vs Spearman")
+    ax.set_xlabel(r"$|r_P - r_S|$")
+    ax.set_ylabel("Number of pairs")
+
+
+def save_mouse_diagnostic_dashboard(
+    mouse_id: int,
+    diag_df: pd.DataFrame,
+    pair_df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    axes = axes.ravel()
+
+    # 1) skewness
+    skew_vals = diag_df["skewness"].dropna()
+    if skew_vals.empty:
+        axes[0].text(0.5, 0.5, "No valid data", ha="center", va="center")
+    else:
+        sns.histplot(skew_vals, bins=40, kde=True, ax=axes[0])
+    axes[0].set_title("Spike-count skewness")
+    axes[0].set_xlabel("Skewness")
+    axes[0].set_ylabel("Number of neurons")
+
+    # 2) kurtosis
+    kurt_vals = diag_df["kurtosis"].dropna()
+    if kurt_vals.empty:
+        axes[1].text(0.5, 0.5, "No valid data", ha="center", va="center")
+    else:
+        sns.histplot(kurt_vals, bins=40, kde=True, ax=axes[1])
+    axes[1].set_title("Spike-count kurtosis")
+    axes[1].set_xlabel("Excess kurtosis")
+    axes[1].set_ylabel("Number of neurons")
+
+    # 3) zero fraction
+    zero_vals = diag_df["zero_fraction"].dropna()
+    if zero_vals.empty:
+        axes[2].text(0.5, 0.5, "No valid data", ha="center", va="center")
+    else:
+        sns.histplot(zero_vals, bins=40, kde=False, ax=axes[2])
+    axes[2].set_title("Zero-bin fraction")
+    axes[2].set_xlabel("Fraction of 100 ms bins with zero spikes")
+    axes[2].set_ylabel("Number of neurons")
+
+    # 4) max/median
+    ratio_vals = diag_df["max_to_median"].replace([np.inf, -np.inf], np.nan).dropna()
+    if ratio_vals.empty:
+        axes[3].text(0.5, 0.5, "No valid data", ha="center", va="center")
+    else:
+        sns.histplot(ratio_vals, bins=40, kde=False, ax=axes[3])
+    axes[3].set_title("Max / median spike-count ratio")
+    axes[3].set_xlabel("Max count / median count")
+    axes[3].set_ylabel("Number of neurons")
+
+    # 5) Pearson vs Spearman scatter
+    if pair_df.empty:
+        axes[4].text(0.5, 0.5, "No valid pairs", ha="center", va="center")
+        axes[4].set_title("Pearson vs Spearman")
+        axes[4].set_xlabel("Pearson r")
+        axes[4].set_ylabel("Spearman ρ")
+    else:
+        sns.scatterplot(
+            data=pair_df,
+            x="pearson_r",
+            y="spearman_r",
+            s=18,
+            alpha=0.4,
+            ax=axes[4],
+        )
+        lim_min = min(pair_df["pearson_r"].min(), pair_df["spearman_r"].min(), -1)
+        lim_max = max(pair_df["pearson_r"].max(), pair_df["spearman_r"].max(), 1)
+        axes[4].plot([lim_min, lim_max], [lim_min, lim_max], linestyle="--", linewidth=1)
+        axes[4].set_xlim(lim_min, lim_max)
+        axes[4].set_ylim(lim_min, lim_max)
+        axes[4].set_title("Pearson vs Spearman")
+        axes[4].set_xlabel("Pearson r")
+        axes[4].set_ylabel("Spearman ρ")
+
+    # 6) |Pearson - Spearman|
+    plot_pair_metric_difference_on_ax(pair_df, axes[5])
+
+    fig.suptitle(f"Mouse {mouse_id}: spike-count diagnostics (100 ms bins)", fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(
+        output_dir / f"mouse_{mouse_id:02d}_diagnostic_dashboard.png",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+def summarize_mouse_diagnostics(
+    mouse_id: int,
+    diag_df: pd.DataFrame,
+    pair_df: pd.DataFrame,
+) -> dict[str, float]:
+
+    if pair_df.empty:
+        mean_abs_diff = np.nan
+        median_abs_diff = np.nan
+    else:
+        mean_abs_diff = float(pair_df["abs_diff"].mean())
+        median_abs_diff = float(pair_df["abs_diff"].median())
+
+    return {
+        "mouse_id": mouse_id,
+
+        "mean_skewness": float(diag_df["skewness"].mean()),
+        "median_skewness": float(diag_df["skewness"].median()),
+
+        "mean_kurtosis": float(diag_df["kurtosis"].mean()),
+        "median_kurtosis": float(diag_df["kurtosis"].median()),
+
+        "mean_zero_fraction": float(diag_df["zero_fraction"].mean()),
+        "median_zero_fraction": float(diag_df["zero_fraction"].median()),
+
+        "mean_max_to_median": float(
+            diag_df["max_to_median"]
+            .replace([np.inf, -np.inf], np.nan)
+            .mean()
+        ),
+
+        "median_max_to_median": float(
+            diag_df["max_to_median"]
+            .replace([np.inf, -np.inf], np.nan)
+            .median()
+        ),
+
+        "mean_abs_r_diff": mean_abs_diff,
+        "median_abs_r_diff": median_abs_diff,
+    }
 
 def main() -> None:
     args = parse_args()
@@ -376,45 +691,92 @@ def main() -> None:
 
     bin_size_s = args.bin_size_ms / 1000.0
     combined_results: list[pd.DataFrame] = []
+    diagnostic_summaries: list[dict] = []
 
     for mouse_id in args.mouse_ids:
+
         mouse_folder = dataset_root / str(mouse_id)
+
         if not mouse_folder.exists():
             print(f"Skipping mouse {mouse_id}: folder not found at {mouse_folder}")
             continue
 
         try:
             mouse_df = load_mouse_clusters(mouse_folder)
-            interaction_df, matrix_df = pairwise_interactions(
+
+            interaction_df, matrix_df, binned = pairwise_interactions(
                 mouse_df=mouse_df,
                 bin_size_s=bin_size_s,
                 include_within_region=True,
             )
+
         except Exception as exc:
             print(f"Skipping mouse {mouse_id}: {exc}")
             continue
 
         interaction_df.insert(0, "mouse_id", mouse_id)
+
         save_mouse_results(mouse_id, interaction_df, matrix_df, output_dir)
 
         if not args.no_plots:
+
             plot_mouse_heatmap(mouse_id, matrix_df, output_dir)
 
+            # compute neuron diagnostics
+            diag_df = compute_neuron_binned_diagnostics(binned, mouse_df)
+
+            # compute Pearson vs Spearman pair diagnostics
+            pair_df = compute_pair_metric_comparison(
+                binned=binned,
+                mouse_df=mouse_df,
+                max_pairs=5000,
+            )
+
+            # save diagnostic tables
+            diag_df.to_csv(
+                output_dir / f"mouse_{mouse_id:02d}_neuron_diagnostics.csv",
+                index=False
+            )
+
+            pair_df.to_csv(
+                output_dir / f"mouse_{mouse_id:02d}_pair_metric_comparison.csv",
+                index=False
+            )
+
+            # diagnostic dashboard plot
+            save_mouse_diagnostic_dashboard(
+                mouse_id=mouse_id,
+                diag_df=diag_df,
+                pair_df=pair_df,
+                output_dir=output_dir,
+            )
+
+            # summarize diagnostics for cross-mouse averages
+            summary_row = summarize_mouse_diagnostics(
+                mouse_id,
+                diag_df,
+                pair_df,
+            )
+
+            diagnostic_summaries.append(summary_row)
+
         combined_results.append(interaction_df)
+
         print(
-            f"Mouse {mouse_id}: saved {len(interaction_df)} region pairs to "
-            f"{output_dir}"
+            f"Mouse {mouse_id}: saved {len(interaction_df)} region pairs to {output_dir}"
         )
 
     if not combined_results:
         raise RuntimeError("No mouse interaction tables were created.")
 
     combined_df = pd.concat(combined_results, ignore_index=True)
+
     within_df = combined_df[
         combined_df["region_a"] == combined_df["region_b"]
     ].copy()
 
     within_df["brain_area"] = within_df["region_a"]
+
     area_ranking_df = (
         within_df.groupby("brain_area", as_index=False)
         .agg(
@@ -426,7 +788,9 @@ def main() -> None:
         .sort_values("mean_abs_pairwise_corr", ascending=False)
         .reset_index(drop=True)
     )
+
     top_area = area_ranking_df.iloc[0]
+
     print(
         f"Strongest brain area at {int(args.bin_size_ms)} ms "
         f"(by mean absolute pairwise correlation): "
@@ -434,16 +798,50 @@ def main() -> None:
         f"[score={top_area['mean_abs_pairwise_corr']:.4f}]"
     )
 
-    area_ranking_df.to_csv(output_dir / "brain_area_abs_interaction_ranking.csv", index=False)
-    combined_df.to_csv(output_dir / "all_mice_region_interactions.csv", index=False)
+    area_ranking_df.to_csv(
+        output_dir / "brain_area_abs_interaction_ranking.csv",
+        index=False
+    )
+
+    combined_df.to_csv(
+        output_dir / "all_mice_region_interactions.csv",
+        index=False
+    )
+
+    # ----- diagnostic summaries across mice -----
+
+    if diagnostic_summaries:
+
+        diagnostics_df = pd.DataFrame(diagnostic_summaries)
+
+        diagnostics_df.to_csv(
+            output_dir / "mouse_diagnostic_summary.csv",
+            index=False
+        )
+
+        global_summary = diagnostics_df.mean(numeric_only=True)
+
+        global_summary.to_csv(
+            output_dir / "diagnostic_global_mean.csv"
+        )
+
+        print("\nAverage diagnostic metrics across mice:\n")
+        print(global_summary)
+
+    # ----- group-level plots -----
 
     if not args.no_plots:
+
         plot_within_area_abs_summary(combined_df, output_dir)
+
         plot_group_mean_heatmap(combined_df, output_dir)
+
         plot_group_pair_summary(combined_df, output_dir)
 
-    print(f"Combined results saved to {output_dir / 'all_mice_region_interactions.csv'}")
-
+    print(
+        f"\nCombined results saved to "
+        f"{output_dir / 'all_mice_region_interactions.csv'}"
+    )
 
 if __name__ == "__main__":
     main()
