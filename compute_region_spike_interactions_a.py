@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default=Path("D:/PreCosyneBrainhack"),
+        default=Path("./brainhack-dataset"),
         help="Root directory containing mouse folders such as 2, 3, ..., 18.",
     )
     parser.add_argument(
@@ -201,6 +201,8 @@ def summarize_region_pair(
     pop_trace_b = binned[idx_b].sum(axis=0)
     population_corr = correlation_or_nan(pop_trace_a, pop_trace_b)
 
+    abs_correlations = np.abs(correlations) if correlations else []
+
     return [
         {
             "region_a": region_a,
@@ -211,6 +213,8 @@ def summarize_region_pair(
             "n_neuron_pairs": int(len(correlations)),
             "mean_pairwise_corr": float(np.mean(correlations)) if correlations else np.nan,
             "median_pairwise_corr": float(np.median(correlations)) if correlations else np.nan,
+            "mean_abs_pairwise_corr": float(np.mean(abs_correlations)) if correlations else np.nan,
+            "median_abs_pairwise_corr": float(np.median(abs_correlations)) if correlations else np.nan,
             "population_corr": population_corr,
         }
     ]
@@ -318,6 +322,50 @@ def plot_group_mean_heatmap(combined_df: pd.DataFrame, output_dir: Path) -> None
     )
 
 
+def plot_within_area_abs_summary(combined_df: pd.DataFrame, output_dir: Path) -> None:
+    within_df = combined_df[combined_df["region_a"] == combined_df["region_b"]].copy()
+    within_df["brain_area"] = within_df["region_a"]
+
+    area_order = (
+        within_df.groupby("brain_area")["mean_abs_pairwise_corr"]
+        .mean()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.boxplot(
+        data=within_df,
+        x="brain_area",
+        y="mean_abs_pairwise_corr",
+        order=area_order,
+        color="lightsteelblue",
+        ax=ax,
+    )
+    sns.stripplot(
+        data=within_df,
+        x="brain_area",
+        y="mean_abs_pairwise_corr",
+        order=area_order,
+        color="black",
+        size=4,
+        alpha=0.7,
+        ax=ax,
+    )
+
+    ax.set_title("Within-area interaction strength across mice (100 ms bins)")
+    ax.set_xlabel("Brain area")
+    ax.set_ylabel("Mean |Pearson r| across neuron pairs")
+    plt.xticks(rotation=45, ha="right")
+    fig.tight_layout()
+    fig.savefig(
+        output_dir / "all_mice_within_area_mean_abs_pairwise_corr.png",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     dataset_root = args.dataset_root
@@ -340,7 +388,7 @@ def main() -> None:
             interaction_df, matrix_df = pairwise_interactions(
                 mouse_df=mouse_df,
                 bin_size_s=bin_size_s,
-                include_within_region=args.include_within_region,
+                include_within_region=True,
             )
         except Exception as exc:
             print(f"Skipping mouse {mouse_id}: {exc}")
@@ -362,9 +410,35 @@ def main() -> None:
         raise RuntimeError("No mouse interaction tables were created.")
 
     combined_df = pd.concat(combined_results, ignore_index=True)
+    within_df = combined_df[
+        combined_df["region_a"] == combined_df["region_b"]
+    ].copy()
+
+    within_df["brain_area"] = within_df["region_a"]
+    area_ranking_df = (
+        within_df.groupby("brain_area", as_index=False)
+        .agg(
+            mean_abs_pairwise_corr=("mean_abs_pairwise_corr", "mean"),
+            median_abs_pairwise_corr=("median_abs_pairwise_corr", "mean"),
+            mean_signed_pairwise_corr=("mean_pairwise_corr", "mean"),
+            mice_count=("mouse_id", "nunique"),
+        )
+        .sort_values("mean_abs_pairwise_corr", ascending=False)
+        .reset_index(drop=True)
+    )
+    top_area = area_ranking_df.iloc[0]
+    print(
+        f"Strongest brain area at {int(args.bin_size_ms)} ms "
+        f"(by mean absolute pairwise correlation): "
+        f"{top_area['brain_area']} "
+        f"[score={top_area['mean_abs_pairwise_corr']:.4f}]"
+    )
+
+    area_ranking_df.to_csv(output_dir / "brain_area_abs_interaction_ranking.csv", index=False)
     combined_df.to_csv(output_dir / "all_mice_region_interactions.csv", index=False)
 
     if not args.no_plots:
+        plot_within_area_abs_summary(combined_df, output_dir)
         plot_group_mean_heatmap(combined_df, output_dir)
         plot_group_pair_summary(combined_df, output_dir)
 
