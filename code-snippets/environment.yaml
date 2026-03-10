@@ -1,0 +1,12 @@
+name: con2phys
+dependencies:
+  - python
+  - pip
+  - matplotlib
+  - seaborn
+  - numpy
+  - pandas
+  - scipy
+  - notebook
+  - scikit-learn
+  - statsmodels
